@@ -21,9 +21,9 @@ col_input1, col_input2 = st.columns(2)
 
 with col_input1:
     days_back = st.number_input(
-        "Enter number of days to go back (max 365):",
+        "Enter number of days to go back (max 598):",
         min_value=1,
-        max_value=365,
+        max_value=598,
         value=120,
         step=1
     )
