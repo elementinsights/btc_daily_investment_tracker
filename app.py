@@ -1,174 +1,282 @@
+import math
 import json
-import streamlit as st
+from pathlib import Path
+from typing import Optional, Union, Dict
+
+import numpy as np
 import pandas as pd
-import altair as alt
+import streamlit as st
 
-# Load BTC price JSON file
-with open("btc_prices.json", "r") as f:
-    btc_data = json.load(f)
+# ==============================
+# App Config
+# ==============================
+st.set_page_config(
+    page_title="DCA & SDCA Simulator",
+    page_icon="📈",
+    layout="wide",
+)
 
-# Convert to DataFrame
-df_prices = pd.DataFrame(btc_data)
-df_prices['Date'] = pd.to_datetime(df_prices['Date'])
-df_prices = df_prices.sort_values('Date').reset_index(drop=True)
+# ==============================
+# Data Discovery
+# ==============================
 
-# ---- Streamlit UI ----
-st.set_page_config(page_title="BTC DCA Simulator", layout="wide")
-st.title("Bitcoin Investment Tracker")
+def discover_price_files() -> Dict[str, Path]:
+    """
+    Find files matching '*_prices.json' in:
+      - the same directory as this script
+      - an optional 'data' subdirectory
 
-# --- User Inputs ---
-col1, col2 = st.columns(2)
+    Returns a dict mapping SYMBOL -> Path, where SYMBOL is
+    the part before the first underscore, uppercased.
+    e.g. 'btc_prices.json' -> 'BTC'
+    """
+    here = Path(__file__).parent
+    candidates = list(here.glob("*_prices.json"))
 
-with col1:
-    days_back = st.number_input(
-        "Enter number of days to go back (max 598):",
-        min_value=1,
-        max_value=598,
-        value=120,
-        step=1
-    )
+    data_dir = here / "data"
+    if data_dir.exists():
+        candidates += list(data_dir.glob("*_prices.json"))
 
-with col2:
-    investment_amount = st.number_input(
-        "Investment amount per interval ($):",
-        min_value=1,
-        max_value=10000,
-        value=100,
-        step=10
-    )
+    mapping: Dict[str, Path] = {}
+    for p in candidates:
+        stem = p.stem  # e.g., 'btc_prices'
+        if "_" in stem:
+            symbol = stem.split("_", 1)[0].upper()
+        else:
+            # fallback: whole stem uppercased
+            symbol = stem.upper()
+        # prefer file closer to app (here) if duplicates exist
+        if symbol not in mapping:
+            mapping[symbol] = p
+    return mapping
 
-# --- Horizontal Radio Buttons ---
-col_freq, col_yaxis = st.columns([1, 2])
+# ==============================
+# Data Loading
+# ==============================
 
-with col_freq:
-    investment_frequency = st.radio(
-        "Investment frequency:",
-        options=["Daily", "Weekly", "Monthly"],
-        horizontal=True
-    )
+@st.cache_data(show_spinner=False)
+def load_prices_from_json(json_path: Union[str, Path]) -> pd.DataFrame:
+    """
+    Expected schema:
+    [
+      {"Date": "2023-12-11", "Close": 41237.43},
+      ...
+    ]
+    """
+    json_path = Path(json_path)
+    if not json_path.exists():
+        return pd.DataFrame(columns=["Date", "Close"])
 
-with col_yaxis:
-    y_axis_mode = st.radio(
-        "Y-axis chart mode:",
-        options=["Portfolio Value", "% Gain"],
-        horizontal=True
-    )
+    with open(json_path, "r") as f:
+        raw = json.load(f)
 
-# --- Filter DataFrame ---
-if len(df_prices) >= days_back:
-    filtered_df = df_prices.tail(days_back).reset_index(drop=True)
-else:
-    st.warning(
-        f"Only {len(df_prices)} days of data are available, "
-        f"but you requested {days_back} days. Showing all available data."
-    )
-    filtered_df = df_prices.reset_index(drop=True)
+    df = pd.DataFrame(raw)
+    if "Date" not in df.columns or "Close" not in df.columns:
+        return pd.DataFrame(columns=["Date", "Close"])
 
-# --- Apply frequency slicing ---
-if investment_frequency == "Daily":
-    df_invest = filtered_df.copy()
-elif investment_frequency == "Weekly":
-    df_invest = filtered_df.iloc[::7].reset_index(drop=True)
-elif investment_frequency == "Monthly":
-    df_invest = filtered_df.iloc[::30].reset_index(drop=True)
-else:
-    df_invest = filtered_df.copy()
+    df["Date"] = pd.to_datetime(df["Date"], utc=True).dt.tz_localize(None)
+    df = df.sort_values("Date").dropna(subset=["Close"])
+    df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
+    df = df.dropna(subset=["Close"]).reset_index(drop=True)
+    return df[["Date", "Close"]]
 
-# --- Portfolio Simulation ---
-if df_invest.empty:
-    st.error("No data available to display.")
-else:
-    total_invested = 0
-    btc_holding = 0
-    portfolio_values = []
-    total_invested_list = []
-    btc_price_list = []
-    pct_gains = []
+@st.cache_data(show_spinner=False)
+def load_prices_from_symbol(symbol_to_path: Dict[str, Path], symbol: str) -> pd.DataFrame:
+    if symbol not in symbol_to_path:
+        return pd.DataFrame(columns=["Date", "Close"])
+    return load_prices_from_json(symbol_to_path[symbol])
 
-    for _, row in df_invest.iterrows():
-        price = row['Close']
-        btc_bought = investment_amount / price
-        btc_holding += btc_bought
-        total_invested += investment_amount
+# ==============================
+# SDCA / DCA Core
+# ==============================
 
-        portfolio_value = btc_holding * price
-        gain_pct = ((portfolio_value - total_invested) / total_invested) * 100
+FREQ_LABELS = {"Daily": "D", "Weekly": "W-SUN", "Monthly": "M"}
 
-        btc_price_list.append(price)
-        portfolio_values.append(portfolio_value)
-        total_invested_list.append(total_invested)
-        pct_gains.append(gain_pct)
-
-    # Create results DataFrame
-    df_results = pd.DataFrame({
-        'Investment #': range(1, len(df_invest) + 1),
-        'Date': df_invest['Date'],
-        'BTC Price': btc_price_list,
-        'Portfolio Value': portfolio_values,
-        'Total Invested': total_invested_list,
-        '% Gain': pct_gains
-    })
-
-    # --- Total Return Calculation ---
-    final_value = portfolio_values[-1]
-    final_invested = total_invested_list[-1]
-    dollar_return = final_value - final_invested
-    percent_return = (final_value / final_invested - 1) * 100
-
-    # --- Format functions ---
-    def format_usd(x): return f"${x:,.2f}"
-    def format_pct(x): return f"{x:.2f}%"
-
-    # --- Format table for display ---
-    df_display = df_results.copy()
-    df_display['BTC Price'] = df_display['BTC Price'].map(format_usd)
-    df_display['Portfolio Value'] = df_display['Portfolio Value'].map(format_usd)
-    df_display['Total Invested'] = df_display['Total Invested'].map(format_usd)
-    df_display['% Gain'] = df_display['% Gain'].map(format_pct)
-
-    # --- Chart Section ---
-    st.subheader("Portfolio Performance Over Time")
-
-    # ⏱ Weekly Investment Day Label
-    if investment_frequency == "Weekly":
-        weekday = df_invest['Date'].iloc[0].day_name()
-        st.markdown(f"🗓️ **Weekly investments occur on:** `{weekday}s`")
-
-    # 💹 Total Return Display
-    if y_axis_mode == "Portfolio Value":
-        st.markdown(f"💰 **Total Return:** `{format_usd(dollar_return)}`")
+def aggregate_prices(df: pd.DataFrame, frequency: str) -> pd.Series:
+    """Aggregate close prices to the chosen frequency."""
+    if df.empty:
+        return pd.Series(dtype=float)
+    s = df.set_index("Date")["Close"].sort_index()
+    if frequency == "Daily":
+        return s
+    elif frequency == "Weekly":
+        return s.resample("W-SUN").last().dropna()
+    elif frequency == "Monthly":
+        return s.resample("M").last().dropna()
     else:
-        st.markdown(f"📈 **Total Return:** `{format_pct(percent_return)}`")
+        raise ValueError(f"Unknown frequency: {frequency}")
 
-    # --- Chart Generation ---
-    if y_axis_mode == "Portfolio Value":
-        chart_data = df_results.melt(
-            id_vars=['Investment #'],
-            value_vars=['Portfolio Value', 'Total Invested'],
-            var_name='Metric',
-            value_name='Value'
+def simulate_standard_dca(prices: pd.Series, base: float) -> pd.DataFrame:
+    rows = []
+    cum_units = 0.0
+    total_invested = 0.0
+    for dt, price in prices.items():
+        invest = base
+        units = invest / price
+        cum_units += units
+        total_invested += invest
+        rows.append({
+            "Date": dt, "Price": float(price), "Invest": float(invest), "Units": float(units),
+            "CumUnits": float(cum_units), "TotalInvested": float(total_invested),
+            "Action": "base", "SkipsLeft": 0, "Mult": 1
+        })
+    out = pd.DataFrame(rows).sort_values("Date")
+    out["PortfolioValue"] = out["CumUnits"] * out["Price"]
+    out["ROI_%"] = np.where(out["TotalInvested"] > 0,
+                            (out["PortfolioValue"] / out["TotalInvested"] - 1.0) * 100.0, 0.0)
+    return out
+
+def simulate_sdca(prices: pd.Series, base: float, threshold_pct: float,
+                  max_k: Optional[int] = None) -> pd.DataFrame:
+    """
+    Special DCA logic:
+    - If drop >= k * threshold from previous interval, invest (1+k)*base, skip k future intervals.
+    """
+    rows = []
+    prev_price = None
+    skip = 0
+    cum_units = 0.0
+    total_invested = 0.0
+    g = threshold_pct / 100.0 if threshold_pct else 0.0
+
+    for dt, price in prices.items():
+        action = "base"
+        mult = 1
+        invest = 0.0
+
+        if prev_price is None:
+            invest = base
+            action = "base (first)"
+        elif skip > 0:
+            action = f"skip ({skip} left)"
+            skip -= 1
+        else:
+            change = (price - prev_price) / prev_price if prev_price != 0 else 0.0
+            if change < 0 and g > 0:
+                k = math.floor(abs(change) / g)
+                if max_k is not None and max_k > 0:
+                    k = min(k, max_k)
+                if k > 0:
+                    mult = 1 + k
+                    invest = base * mult
+                    skip = k
+                    action = f"dip {k}× → buy {mult}×, skip {k}"
+                else:
+                    invest = base
+            else:
+                invest = base
+
+        units = invest / price if invest > 0 else 0.0
+        cum_units += units
+        total_invested += invest
+
+        rows.append({
+            "Date": dt, "Price": float(price), "Invest": float(invest), "Units": float(units),
+            "CumUnits": float(cum_units), "TotalInvested": float(total_invested),
+            "Action": action, "SkipsLeft": skip, "Mult": mult
+        })
+
+        prev_price = price
+
+    out = pd.DataFrame(rows).sort_values("Date")
+    out["PortfolioValue"] = out["CumUnits"] * out["Price"]
+    out["ROI_%"] = np.where(out["TotalInvested"] > 0,
+                            (out["PortfolioValue"] / out["TotalInvested"] - 1.0) * 100.0, 0.0)
+    return out
+
+# ==============================
+# UI
+# ==============================
+
+st.title("📈 DCA & SDCA Simulator")
+st.caption("Simulate standard dollar-cost averaging or SDCA with skip windows on dips.")
+
+with st.sidebar:
+    st.header("Inputs")
+
+    # --- Data Source dropdown ---
+    symbol_to_path = discover_price_files()
+    if not symbol_to_path:
+        st.error(
+            "No data files found. Place JSON files named like '*_prices.json' "
+            "(e.g., btc_prices.json, eth_prices.json) next to the app or in a 'data/' folder."
         )
+        df_prices = pd.DataFrame(columns=["Date", "Close"])
+        symbol = None
+    else:
+        symbols = sorted(symbol_to_path.keys())
+        symbol = st.selectbox("Data Source", symbols, index=0, help="Picks from *_prices.json files found.")
+        df_prices = load_prices_from_symbol(symbol_to_path, symbol)
 
-        chart = alt.Chart(chart_data).mark_line().encode(
-            x='Investment #:Q',
-            y='Value:Q',
-            color='Metric:N'
-        ).properties(
-            width='container',
-            height=400
-        )
-    else:  # % Gain
-        chart = alt.Chart(df_results).mark_line().encode(
-            x='Investment #:Q',
-            y=alt.Y('% Gain:Q', title='% Gain'),
-            color=alt.value("green")
-        ).properties(
-            width='container',
-            height=400
-        )
+    if not df_prices.empty:
+        min_dt = df_prices["Date"].min()
+        max_dt = df_prices["Date"].max()
+        start_date = st.date_input("Start", value=min_dt.date(),
+                                   min_value=min_dt.date(), max_value=max_dt.date())
+        end_date = st.date_input("End", value=max_dt.date(),
+                                 min_value=min_dt.date(), max_value=max_dt.date())
+        if start_date > end_date:
+            start_date, end_date = end_date, start_date
+        mask = (df_prices["Date"].dt.date >= start_date) & (df_prices["Date"].dt.date <= end_date)
+        df_prices = df_prices.loc[mask].reset_index(drop=True)
 
-    st.altair_chart(chart, use_container_width=True)
+    frequency = st.radio("Frequency", ["Daily", "Weekly", "Monthly"], horizontal=True)
+    strategy = st.radio("Strategy", ["Standard DCA", "SDCA (Special DCA)"], horizontal=True)
+    base_amount = st.number_input("Base investment ($)", min_value=1.0, value=100.0, step=10.0)
 
-    # --- Table Below Chart ---
-    st.subheader("Investment Table")
-    st.dataframe(df_display, use_container_width=True, height=600, hide_index=True)
+    if strategy.startswith("SDCA"):
+        threshold = st.number_input("Dip threshold (%)", min_value=0.1, value=5.0, step=0.1)
+        max_k = st.slider("Cap k (0 = no cap)", 0, 10, 0)
+        max_k = None if max_k == 0 else int(max_k)
+    else:
+        threshold, max_k = 0.0, None
+
+    run_button = st.button("Run Simulation", type="primary")
+
+# ==============================
+# Simulation & Results
+# ==============================
+
+if run_button:
+    if df_prices.empty:
+        st.stop()
+
+    prices_series = aggregate_prices(df_prices, frequency)
+    if prices_series.empty:
+        st.warning("No prices in selected range.")
+        st.stop()
+
+    if strategy == "Standard DCA":
+        sim = simulate_standard_dca(prices_series, base_amount)
+    else:
+        sim = simulate_sdca(prices_series, base_amount, threshold, max_k)
+
+    last_row = sim.iloc[-1]
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Invested", f"${last_row['TotalInvested']:,.2f}")
+    c2.metric("Final Value", f"${last_row['PortfolioValue']:,.2f}")
+    c3.metric("ROI", f"{last_row['ROI_%']:.2f}%")
+    c4.metric("Total Units", f"{last_row['CumUnits']:.8f}")
+
+    st.subheader(f"{symbol or ''} Portfolio vs Invested")
+    st.line_chart(sim.set_index("Date")[["PortfolioValue", "TotalInvested"]])
+
+    st.subheader("Price & Investment per Interval")
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        st.line_chart(sim.set_index("Date")[["Price"]])
+    with col2:
+        st.bar_chart(sim.set_index("Date")[["Invest"]])
+
+    st.subheader("Transactions")
+    pretty = sim.copy()
+    pretty["Date"] = pretty["Date"].dt.strftime("%Y-%m-%d")
+    st.dataframe(pretty[["Date", "Price", "Invest", "Units", "CumUnits",
+                         "TotalInvested", "PortfolioValue", "ROI_%", "Action"]],
+                 use_container_width=True, height=400)
+
+    csv = pretty.to_csv(index=False).encode("utf-8")
+    fname_symbol = (symbol or "data").lower()
+    st.download_button("Download CSV", csv, f"simulation_{fname_symbol}.csv", "text/csv")
+else:
+    st.info("Set inputs and click **Run Simulation**.")
