@@ -43,7 +43,6 @@ def discover_price_files() -> Dict[str, Path]:
         if "_" in stem:
             symbol = stem.split("_", 1)[0].upper()
         else:
-            # fallback: whole stem uppercased
             symbol = stem.upper()
         # prefer file closer to app (here) if duplicates exist
         if symbol not in mapping:
@@ -208,15 +207,21 @@ with st.sidebar:
         symbol = st.selectbox("Data Source", symbols, index=0, help="Picks from *_prices.json files found.")
         df_prices = load_prices_from_symbol(symbol_to_path, symbol)
 
+    # --- Date Range (slider) tied to the selected asset's data range ---
     if not df_prices.empty:
         min_dt = df_prices["Date"].min()
         max_dt = df_prices["Date"].max()
-        start_date = st.date_input("Start", value=min_dt.date(),
-                                   min_value=min_dt.date(), max_value=max_dt.date())
-        end_date = st.date_input("End", value=max_dt.date(),
-                                 min_value=min_dt.date(), max_value=max_dt.date())
-        if start_date > end_date:
-            start_date, end_date = end_date, start_date
+
+        date_range = st.slider(
+            "Date Range",
+            min_value=min_dt.date(),
+            max_value=max_dt.date(),
+            value=(min_dt.date(), max_dt.date()),
+            format="YYYY-MM-DD",
+        )
+        start_date, end_date = date_range
+
+        # Filter to selected range
         mask = (df_prices["Date"].dt.date >= start_date) & (df_prices["Date"].dt.date <= end_date)
         df_prices = df_prices.loc[mask].reset_index(drop=True)
 
